@@ -701,6 +701,8 @@ def movingAverage(requestContext, seriesList, windowSize):
     &target=movingAverage(Server.instance*.threads.idle,'5min')
 
   """
+  if not seriesList:
+    return []
   windowInterval = None
   if type(windowSize) is str:
     delta = parseTimeOffset(windowSize)
