@@ -1,46 +1,62 @@
-import socket
 import time
-import httplib
+import urllib3
+from Queue import Queue
 from urllib import urlencode
-from threading import Lock, Event
+from threading import Lock, current_thread
 from django.conf import settings
 from django.core.cache import cache
-from graphite.node import LeafNode, BranchNode
 from graphite.intervals import Interval, IntervalSet
+from graphite.node import LeafNode, BranchNode
 from graphite.readers import FetchInProgress
 from graphite.logger import log
+from graphite.util import unpickle, logtime, timebounds
+from graphite.render.hashing import compactHash
+from graphite.worker_pool.pool import get_pool
 
-try:
-  import cPickle as pickle
-except ImportError:
-  import pickle
+http = urllib3.PoolManager(num_pools=10, maxsize=5)
+
+
+def prefetchRemoteData(remote_stores, requestContext, pathExpressions):
+  if requestContext['localOnly']:
+    return
+
+  if requestContext is None:
+    requestContext = {}
+
+  (startTime, endTime, now) = timebounds(requestContext)
+  log.info('thread %s prefetchRemoteData:: Starting fetch_list on all backends' % current_thread().name)
+
+  # Go through all of the remote nodes, and launch a fetch for each one.
+  # Each fetch will take place in its own thread, since it's naturally parallel work.
+  for pathExpr in pathExpressions:
+    for store in remote_stores:
+      reader = RemoteReader(store, {'path': pathExpr, 'intervals': []}, bulk_query=pathExpr)
+      reader.fetch_list(startTime, endTime, now, requestContext)
 
 
 class RemoteStore(object):
-  lastFailure = 0.0
-  available = property(lambda self: time.time() - self.lastFailure > settings.REMOTE_RETRY_DELAY)
 
   def __init__(self, host):
     self.host = host
+    self.last_failure = 0
 
-  def find(self, query):
-    request = FindRequest(self, query)
-    request.send()
-    return request
+  @property
+  def available(self):
+    return time.time() - self.last_failure > settings.REMOTE_RETRY_DELAY
+
+  def find(self, query, headers=None):
+    return list(FindRequest(self, query).send(headers))
 
   def fail(self):
-    self.lastFailure = time.time()
+    self.last_failure = time.time()
 
 
 class FindRequest(object):
-  __slots__ = ('store', 'query', 'connection',
-               'failed', 'cacheKey', 'cachedResult')
+  __slots__ = ('store', 'query', 'cacheKey')
 
   def __init__(self, store, query):
     self.store = store
     self.query = query
-    self.connection = None
-    self.failed = False
 
     if query.startTime:
       start = query.startTime - (query.startTime % settings.FIND_CACHE_DURATION)
@@ -52,220 +68,255 @@ class FindRequest(object):
     else:
       end = ""
 
-    self.cacheKey = "find:%s:%s:%s:%s" % (store.host, query.pattern, start, end)
-    self.cachedResult = None
+    self.cacheKey = "find:%s:%s:%s:%s" % (store.host, compactHash(query.pattern), start, end)
 
-  def send(self):
+  @logtime(custom_msg=True)
+  def send(self, headers=None, msg_setter=None):
     log.info("FindRequest.send(host=%s, query=%s) called" % (self.store.host, self.query))
 
-    self.cachedResult = cache.get(self.cacheKey)
-    if self.cachedResult is not None:
-      log.info("FindRequest(host=%s, query=%s) using cached result" % (self.store.host, self.query))
-      return
+    if headers is None:
+      headers = {}
 
-    self.connection = HTTPConnectionWithTimeout(self.store.host)
-    self.connection.timeout = settings.REMOTE_FIND_TIMEOUT
-
-    query_params = [
-      ('local', '1'),
-      ('format', 'pickle'),
-      ('query', self.query.pattern),
-    ]
-    if self.query.startTime:
-      query_params.append( ('from', self.query.startTime) )
-
-    if self.query.endTime:
-      query_params.append( ('until', self.query.endTime) )
-
-    query_string = urlencode(query_params)
-
-    try:
-      self.connection.request('GET', '/metrics/find/?' + query_string)
-    except:
-      log.exception("FindRequest.send(host=%s, query=%s) exception during request" % (self.store.host, self.query))
-      self.store.fail()
-      self.failed = True
-
-  def get_results(self):
-    if self.failed:
-      return
-
-    if self.cachedResult is not None:
-      results = self.cachedResult
+    results = cache.get(self.cacheKey)
+    if results is not None:
+      log.info("FindRequest.send(host=%s, query=%s) using cached result" % (self.store.host, self.query))
     else:
-      if self.connection is None:
-        self.send()
+      url = "%s://%s/metrics/find/" % ('https' if settings.INTRACLUSTER_HTTPS else 'http', self.store.host)
+
+      query_params = [
+        ('local', '1'),
+        ('format', 'pickle'),
+        ('query', self.query.pattern),
+      ]
+      if self.query.startTime:
+        query_params.append( ('from', self.query.startTime) )
+
+      if self.query.endTime:
+        query_params.append( ('until', self.query.endTime) )
 
       try:
-        response = self.connection.getresponse()
-        assert response.status == 200, "received error response %s - %s" % (response.status, response.reason)
-        result_data = response.read()
-        results = pickle.loads(result_data)
-
+        result = http.request('POST' if settings.REMOTE_STORE_USE_POST else 'GET',
+                              url, fields=query_params, headers=headers, timeout=settings.REMOTE_FIND_TIMEOUT)
       except:
-        log.exception("FindRequest.get_results(host=%s, query=%s) exception processing response" % (self.store.host, self.query))
+        log.exception("FindRequest.send(host=%s, query=%s) exception during request" % (self.store.host, self.query))
+        self.store.fail()
+        return
+
+      if result.status != 200:
+        log.exception("FindRequest.send(host=%s, query=%s) error response %d from %s?%s" % (self.store.host, self.query, result.status, url, urlencode(query_params)))
+        self.store.fail()
+        return
+
+      try:
+        results = unpickle.loads(result.data)
+      except:
+        log.exception("FindRequest.send(host=%s, query=%s) exception processing response" % (self.store.host, self.query))
         self.store.fail()
         return
 
       cache.set(self.cacheKey, results, settings.FIND_CACHE_DURATION)
 
+    msg_setter('host: {host}, query: {query}'.format(host=self.store.host, query=self.query))
+
     for node_info in results:
-      if node_info.get('is_leaf'):
+      # handle both 1.x and 0.9.x output
+      path = node_info.get('path') or node_info.get('metric_path')
+      is_leaf = node_info.get('is_leaf') or node_info.get('isLeaf')
+      intervals = node_info.get('intervals') or []
+      if not isinstance(intervals, IntervalSet):
+        intervals = IntervalSet([Interval(interval[0], interval[1]) for interval in intervals])
+
+      node_info = {
+        'is_leaf': is_leaf,
+        'path': path,
+        'intervals': intervals,
+      }
+
+      if is_leaf:
         reader = RemoteReader(self.store, node_info, bulk_query=self.query.pattern)
-        node = LeafNode(node_info['path'], reader)
+        node = LeafNode(path, reader)
       else:
-        node = BranchNode(node_info['path'])
+        node = BranchNode(path)
 
       node.local = False
       yield node
 
 
 class RemoteReader(object):
-  __slots__ = ('store', 'metric_path', 'intervals', 'query')
-  cache_lock = Lock()
-  request_cache = {}
-  request_locks = {}
-  request_times = {}
+  __slots__ = ('store', 'metric_path', 'intervals', 'query', 'connection')
+  inflight_lock = Lock()
 
   def __init__(self, store, node_info, bulk_query=None):
     self.store = store
-    self.metric_path = node_info['path']
+    self.metric_path = node_info.get('path') or node_info.get('metric_path')
     self.intervals = node_info['intervals']
-    self.query = bulk_query or node_info['path']
+    self.query = bulk_query or self.metric_path
+    self.connection = None
 
   def __repr__(self):
     return '<RemoteReader[%x]: %s>' % (id(self), self.store.host)
 
+  @staticmethod
+  def _log(msg, logger):
+    logger(('thread %s at %fs ' % (current_thread().name, time.time())) + msg)
+
+  @classmethod
+  def log_debug(cls, msg):
+    if settings.DEBUG:
+      cls._log(msg, log.info)
+
+  @classmethod
+  def log_error(cls, msg):
+    cls._log(msg, log.exception)
+
   def get_intervals(self):
     return self.intervals
 
-  def fetch(self, startTime, endTime):
+  def fetch(self, startTime, endTime, now=None, requestContext=None):
+    seriesList = self.fetch_list(startTime, endTime, now, requestContext)
+
+    def _fetch(seriesList):
+      if seriesList is None:
+        return None
+
+      for series in seriesList:
+        if series['name'] == self.metric_path:
+          time_info = (series['start'], series['end'], series['step'])
+          return (time_info, series['values'])
+
+      return None
+
+    if isinstance(seriesList, FetchInProgress):
+      return FetchInProgress(lambda: _fetch(seriesList.waitForResults()))
+
+    return _fetch(seriesList)
+
+  def fetch_list(self, startTime, endTime, now=None, requestContext=None):
+    t = time.time()
+
     query_params = [
       ('target', self.query),
       ('format', 'pickle'),
       ('local', '1'),
-      ('noCache', '1'),
       ('from', str( int(startTime) )),
       ('until', str( int(endTime) ))
     ]
+    if now is not None:
+      query_params.append(('now', str( int(now) )))
+
     query_string = urlencode(query_params)
-    urlpath = '/render/?' + query_string
-    url = "http://%s%s" % (self.store.host, urlpath)
+    urlpath = '/render/'
+    url = "%s://%s%s" % ('https' if settings.INTRACLUSTER_HTTPS else 'http', self.store.host, urlpath)
+    headers = requestContext.get('forwardHeaders') if requestContext else None
 
-    # Quick cache check up front
-    self.clean_cache()
-    cached_results = self.request_cache.get(url)
-    if cached_results:
-      for series in cached_results:
-        if series['name'] == self.metric_path:
-          time_info = (series['start'], series['end'], series['step'])
-          return (time_info, series['values'])
+    cacheKey = "%s?%s" % (url, query_string)
 
-    # Synchronize with other RemoteReaders using the same bulk query.
-    # Despite our use of thread synchronization primitives, the common
-    # case is for synchronizing asynchronous fetch operations within
-    # a single thread.
-    (request_lock, wait_lock, completion_event) = self.get_request_locks(url)
+    if requestContext is not None and 'inflight_requests' in requestContext and cacheKey in requestContext['inflight_requests']:
+      self.log_debug("RemoteReader:: Returning cached FetchInProgress %s?%s" % (url, query_string))
+      return requestContext['inflight_requests'][cacheKey]
 
-    if request_lock.acquire(False): # we only send the request the first time we're called
-      try:
-        log.info("RemoteReader.request_data :: requesting %s" % url)
-        connection = HTTPConnectionWithTimeout(self.store.host)
-        connection.timeout = settings.REMOTE_FETCH_TIMEOUT
-        connection.request('GET', urlpath)
-      except:
-        completion_event.set()
-        self.store.fail()
-        log.exception("Error requesting %s" % url)
-        raise
+    if requestContext is None or 'inflight_locks' not in requestContext or cacheKey not in requestContext['inflight_locks']:
+      with self.inflight_lock:
+        self.log_debug("RemoteReader:: Got global lock %s?%s" % (url, query_string))
+        if requestContext is None:
+          requestContext = {}
+        if 'inflight_locks' not in requestContext:
+          requestContext['inflight_locks'] = {}
+        if 'inflight_requests' not in requestContext:
+          requestContext['inflight_requests'] = {}
+        if cacheKey not in requestContext['inflight_locks']:
+          self.log_debug("RemoteReader:: Creating lock %s?%s" % (url, query_string))
+          requestContext['inflight_locks'][cacheKey] = Lock()
+      self.log_debug("RemoteReader:: Released global lock %s?%s" % (url, query_string))
 
-    def wait_for_results():
-      if wait_lock.acquire(False): # the FetchInProgress that gets waited on waits for the actual completion
-        try:
-          response = connection.getresponse()
-          if response.status != 200:
-            raise Exception("Error response %d %s from %s" % (response.status, response.reason, url))
+    cacheLock = requestContext['inflight_locks'][cacheKey]
 
-          pickled_response = response.read()
-          results = pickle.loads(pickled_response)
-          self.cache_lock.acquire()
-          self.request_cache[url] = results
-          self.cache_lock.release()
-          completion_event.set()
+    with cacheLock:
+      self.log_debug("RemoteReader:: got url lock %s?%s" % (url, query_string))
+
+      if cacheKey in requestContext['inflight_requests']:
+        self.log_debug("RemoteReader:: Returning cached FetchInProgress %s?%s" % (url, query_string))
+        return requestContext['inflight_requests'][cacheKey]
+
+      q = Queue()
+      if settings.USE_WORKER_POOL:
+        get_pool().apply_async(
+          func=self._fetch,
+          args=[url, query_string, query_params, headers],
+          callback=lambda x: q.put(x),
+        )
+      else:
+        q.put(
+          self._fetch(url, query_string, query_params, headers),
+        )
+
+      def retrieve():
+        with retrieve.lock:
+          # if the result is known we return it directly
+          if hasattr(retrieve, '_result'):
+            results = getattr(retrieve, '_result')
+            self.log_debug(
+              'RemoteReader:: retrieve completed (cached) %s' %
+              (', '.join([result['path'] for result in results])),
+            )
+            return results
+
+          # otherwise we get it from the queue and keep it for later
+          results = q.get(block=True)
+
+          for i in range(len(results)):
+            results[i]['path'] = results[i]['name']
+
+          if not results:
+            self.log_debug('RemoteReader:: retrieve has received no results')
+
+          setattr(retrieve, '_result', results)
+          self.log_debug(
+            'RemoteReader:: retrieve completed %s' %
+            (', '.join([result['path'] for result in results])),
+          )
           return results
-        except:
-          completion_event.set()
-          self.store.fail()
-          log.exception("Error requesting %s" % url)
-          raise
 
-      else: # otherwise we just wait on the completion_event
-        completion_event.wait(settings.REMOTE_FETCH_TIMEOUT)
-        cached_results = self.request_cache.get(url)
-        if cached_results is None:
-          raise Exception("Passive remote fetch failed to find cached results")
-        else:
-          return cached_results
+      self.log_debug(
+        'RemoteReader:: Storing FetchInProgress with cacheKey {cacheKey}'
+        .format(cacheKey=cacheKey),
+      )
+      retrieve.lock = Lock()
+      data = FetchInProgress(retrieve)
+      requestContext['inflight_requests'][cacheKey] = data
 
-    def extract_my_results():
-      for series in wait_for_results():
-        if series['name'] == self.metric_path:
-          time_info = (series['start'], series['end'], series['step'])
-          return (time_info, series['values'])
+    self.log_debug("RemoteReader:: Returning %s?%s in %fs" % (url, query_string, time.time() - t))
+    return data
 
-    return FetchInProgress(extract_my_results)
-
-  def clean_cache(self):
-    self.cache_lock.acquire()
+  def _fetch(self, url, query_string, query_params, headers):
+    self.log_debug("RemoteReader:: Starting to execute _fetch %s?%s" % (url, query_string))
     try:
-      if len(self.request_locks) >= settings.REMOTE_READER_CACHE_SIZE_LIMIT:
-        log.info("RemoteReader.request_data :: clearing old from request_cache and request_locks")
-        now = time.time()
-        for url, timestamp in self.request_times.items():
-          age = now - timestamp
-          if age >= (2 * settings.REMOTE_FETCH_TIMEOUT):
-            del self.request_locks[url]
-            del self.request_times[url]
-            if url in self.request_cache:
-              del self.request_cache[url]
-    finally:
-      self.cache_lock.release()
+      self.log_debug("ReadResult:: Requesting %s?%s" % (url, query_string))
+      result = http.request(
+        'POST' if settings.REMOTE_STORE_USE_POST else 'GET',
+        url,
+        fields=query_params,
+        headers=headers,
+        timeout=settings.REMOTE_FETCH_TIMEOUT,
+      )
 
-  def get_request_locks(self, url):
-    self.cache_lock.acquire()
-    try:
-      if url not in self.request_locks:
-        self.request_locks[url] = (Lock(), Lock(), Event())
-        self.request_times[url] = time.time()
-      return self.request_locks[url]
-    finally:
-      self.cache_lock.release()
+      if result.status != 200:
+        self.store.fail()
+        self.log_error("ReadResult:: Error response %d from %s?%s" % (result.status, url, query_string))
+        data = []
+      else:
+        data = unpickle.loads(result.data)
+    except Exception as err:
+      self.store.fail()
+      self.log_error("ReadResult:: Error requesting %s?%s: %s" % (url, query_string, err))
+      data = []
+
+    self.log_debug("RemoteReader:: Completed _fetch %s?%s" % (url, query_string))
+    return data
 
 
-# This is a hack to put a timeout in the connect() of an HTTP request.
-# Python 2.6 supports this already, but many Graphite installations
-# are not on 2.6 yet.
-
-class HTTPConnectionWithTimeout(httplib.HTTPConnection):
-  timeout = 30
-
-  def connect(self):
-    msg = "getaddrinfo returns an empty list"
-    for res in socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM):
-      af, socktype, proto, canonname, sa = res
-      try:
-        self.sock = socket.socket(af, socktype, proto)
-        try:
-          self.sock.settimeout( float(self.timeout) ) # default self.timeout is an object() in 2.6
-        except:
-          pass
-        self.sock.connect(sa)
-        self.sock.settimeout(None)
-      except socket.error, msg:
-        if self.sock:
-          self.sock.close()
-          self.sock = None
-          continue
-      break
-    if not self.sock:
-      raise socket.error, msg
+def extractForwardHeaders(request):
+    headers = {}
+    for name in settings.REMOTE_STORE_FORWARD_HEADERS:
+        headers[name] = request.META.get('HTTP_%s' % name.upper().replace('-', '_'))
+    return headers
